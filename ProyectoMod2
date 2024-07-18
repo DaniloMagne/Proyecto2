@@ -1,0 +1,139 @@
+import psycopg2
+import pandas as pd
+
+# Parámetros de conexión a la base de datos
+conn_params = {
+    'dbname': 'economic_kpis_utb',
+    'user': 'utb_students',
+    'password': 'AVNS_OXQBajkVtAn2czuYQYe',
+    'host': 'pg-diplomado-utb-diplomado-utb-2024.c.aivencloud.com',
+    'port': '24354'
+}
+
+# Función para obtener los países asignados a un CI
+def obtener_paises_asignados(num_ci):
+    conn = None
+    try:
+        conn = psycopg2.connect(**conn_params)
+        cursor = conn.cursor()
+        
+        query_country_info = "SELECT id, country_name FROM country_info WHERE num_ci = %s"
+        cursor.execute(query_country_info, (num_ci,))
+        country_info = cursor.fetchall()
+        
+        if not country_info:
+            raise ValueError("No se encontró información para el país asignado.")
+        
+        return country_info
+    
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+# Función para calcular el IPS
+def calcular_ips(num_ci, country_info):
+    conn = None
+    try:
+        conn = psycopg2.connect(**conn_params)
+        cursor = conn.cursor()
+        
+        resultados = []
+        
+        for country in country_info:
+            country_id = country[0]
+            country_name = country[1]
+
+            query_data = """
+            SELECT y.year, i.indicator_code, y.value
+            FROM yearly_value y
+            JOIN indicator i ON y.indicator_id = i.id
+            WHERE y.country_info_id = %s
+            AND i.indicator_code IN ('SI.POV.GINI', 'NY.GDP.PCAP.KD', 'SP.POP.TOTL', 'SI.POV.LMIC.GP')
+            ORDER BY y.year, i.indicator_code
+            """
+            cursor.execute(query_data, (country_id,))
+            data = cursor.fetchall()
+
+            if data:
+                df = pd.DataFrame(data, columns=['year', 'indicator_code', 'value'])
+                df_pivot = df.pivot(index='year', columns='indicator_code', values='value').reset_index()
+                
+                df_pivot['IPS'] = df_pivot.apply(lambda row: (row['NY.GDP.PCAP.KD'] / row['SP.POP.TOTL']) * (1 - row['SI.POV.GINI']) * (1 - row['SI.POV.LMIC.GP']) if pd.notnull(row['NY.GDP.PCAP.KD']) and pd.notnull(row['SP.POP.TOTL']) and pd.notnull(row['SI.POV.GINI']) and pd.notnull(row['SI.POV.LMIC.GP']) else None, axis=1)
+                
+                for index, row in df_pivot.iterrows():
+                    if pd.notnull(row['IPS']):
+                        resultados.append({
+                            "CI": num_ci,
+                            "Pais": country_name,
+                            "Año": row['year'],
+                            "Indice de Prosperidad": row['IPS']
+                        })
+        
+        return resultados
+    
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+# Función para insertar los resultados del IPS en la base de datos
+def insertar_ips(resultados_ips):
+    conn = None
+    try:
+        conn = psycopg2.connect(**conn_params)
+        cursor = conn.cursor()
+
+        for resultado in resultados_ips:
+            pais = resultado['Pais']
+            año = resultado['Año']
+            ips = resultado['Indice de Prosperidad']
+
+            # Obtener el ID del país
+            query_id_pais = "SELECT id FROM country_info WHERE country_name = %s"
+            cursor.execute(query_id_pais, (pais,))
+            id_pais = cursor.fetchone()[0]
+
+            # Obtener el ID del indicador IPS
+            query_id_ips = "SELECT id FROM indicator WHERE indicator_code = 'SI.PROSP.IDX'"
+            cursor.execute(query_id_ips)
+            id_ips = cursor.fetchone()[0]
+
+            # Verificar si ya existe un registro para este año, país e indicador
+            check_query = """
+            SELECT COUNT(*)
+            FROM yearly_value
+            WHERE country_info_id = %s AND indicator_id = %s AND year = %s
+            """
+            cursor.execute(check_query, (id_pais, id_ips, año))
+            count = cursor.fetchone()[0]
+
+            if count == 0:
+                # Insertar el valor del IPS si no existe ya
+                insert_query = "INSERT INTO yearly_value (country_info_id, indicator_id, year, value) VALUES (%s, %s, %s, %s)"
+                cursor.execute(insert_query, (id_pais, id_ips, año, ips))
+            else:
+                print(f"El registro para el año {año}, país {pais} e indicador IPS ya existe en la base de datos.")
+
+        conn.commit()
+        print("Los resultados del IPS se han insertado correctamente en la base de datos.")
+
+    except Exception as e:
+        print(f"Error al insertar en la base de datos: {e}")
+        conn.rollback()
+
+    finally:
+        if conn:
+            conn.close()
+
+# Obtener países asignados para el CI específico
+num_ci = '9874149'
+paises_asignados = obtener_paises_asignados(num_ci)
+
+# Calcular IPS para los países asignados
+resultados_ips = calcular_ips(num_ci, paises_asignados)
+
+# Insertar resultados IPS en la base de datos
+insertar_ips(resultados_ips)
